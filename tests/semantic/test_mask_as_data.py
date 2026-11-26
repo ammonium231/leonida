@@ -156,6 +156,32 @@ class MaskAsDataTests(unittest.TestCase):
                                      "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"], 32),
                          [2 if i < 10 else 1 for i in range(32)])
 
+    def test_a_copy_read_by_readfirstlane_under_exec_is_the_whole_word(self):
+        # lanes 5-31 are off at the v_mov and keep v5: the first active lane's copy is the 10-lane mask, not their bits
+        lines = ["v_mov_b32_e32 v5, 0x7777", "v_cmp_gt_u32_e64 s10, 10, v0", "v_cmp_gt_u32_e32 vcc_lo, 5, v0",
+                 "s_and_saveexec_b32 s12, vcc_lo", "v_mov_b32_e32 v5, s10", "v_readfirstlane_b32 s14, v5",
+                 "s_mov_b32 exec_lo, s12", "v_mov_b32_e32 v4, s14"]
+        self.check(lines, 32, 0x3FF)
+
+    def test_a_copy_that_a_bitwise_op_combines_with_data_is_the_whole_word(self):
+        # the high half of a 43-lane mask is 0x7ff for every lane, the ones outside the mask included
+        self.check(["v_cmp_gt_u32_e64 s[10:11], 43, v0", "v_mov_b32_e32 v3, s11", "v_and_b32_e32 v4, 1, v3"], 64, 1)
+
+    def test_a_mask_computation_nothing_reads_as_a_mask_keeps_the_idle_lanes(self):
+        # crosslane_fuzz 30472: the xor only feeds a store, so the lanes EXEC has off keep v4 (5-31 here)
+        lines = ["v_mov_b32_e32 v4, 7", "v_cmp_gt_u32_e64 s10, 10, v0", "v_cmp_gt_u32_e32 vcc_lo, 5, v0",
+                 "s_and_saveexec_b32 s12, vcc_lo", "v_mov_b32_e32 v5, s10", "v_xor_b32_e32 v4, v5, v5",
+                 "s_mov_b32 exec_lo, s12"]
+        self.assertEqual(run(lines, 32), [0] * 5 + [7] * 27)
+
+    def test_a_computed_mask_read_through_a_copy_stays_a_mask_under_a_partial_exec(self):
+        # the idiom with EXEC off from lane 20: the v_or3 computes in every lane, a copy and v_readfirstlane carry it on
+        lines = ["v_cmp_gt_u32_e64 s10, 10, v0", "v_cmp_gt_u32_e64 s11, 4, v0", "v_mov_b32_e32 v4, 1",
+                 "v_cmp_gt_u32_e32 vcc_lo, 20, v0", "s_and_saveexec_b32 s13, vcc_lo", "v_mov_b32_e32 v5, s10",
+                 "v_or3_b32 v6, v5, s11, s11", "v_mov_b32_e32 v7, v6", "v_readfirstlane_b32 s14, v7",
+                 "s_mov_b32 exec_lo, s13", "s_and_saveexec_b32 s12, s14", "v_mov_b32_e32 v4, 2", "s_mov_b32 exec_lo, s12"]
+        self.assertEqual(run(lines, 32), [2 if i < 10 else 1 for i in range(32)])
+
     def test_two_moves_that_meet_at_a_mask_read(self):
         # one of two copies on two paths, then read as a mask: both keep the lane's own bit
         lines = ["v_cmp_gt_u32_e64 s10, 10, v0", "v_cmp_gt_u32_e64 s11, 4, v0", "v_mov_b32_e32 v5, s10",

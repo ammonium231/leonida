@@ -33,6 +33,10 @@ def masks_at_last(blocks, succ, block=-1):
     return set(L.analyse(blocks, succ)[0][id(blocks[block][-1])])
 
 
+def moves_of(blocks, succ, wave64=True):
+    return L.number_moves(blocks, succ, L.analyse(blocks, succ, wave64=wave64)[0], wave64)
+
+
 def test_straight_line():
     use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
     # A saved EXEC is a mask, in both registers of the pair.
@@ -138,6 +142,65 @@ def test_vmov_mask_copy_is_exec_gated():
     got, writes = L.analyse(blocks, [[]])
     assert ("v", 2) in got[id(use)] and ("v", 3) in got[id(use)]
     assert writes == {id(calc)}
+
+
+def test_number_moves_follow_what_reads_the_copy():
+    # SHADER-MASK-AS-DATA: a mask copied into a VGPR is a number unless something reads that VGPR as a mask
+    cmp_a, cmp_b = ins("v_cmp_gt_u32_e64", s(3), v(7), v(7)), ins("v_cmp_lt_u32_e64", s(47), v(7), v(8))
+    # v_readfirstlane of a plain copy (the copy skips the lanes EXEC has off): the move stays
+    cmp18, exec_lo = ins("v_cmp_gt_u32_e64", s(18), v(7), v(7)), ins("s_mov_b32", sp("exec_lo"), imm(0x110c5))
+    mov = ins("v_mov_b32_e32", v(6), s(18))
+    assert moves_of([[cmp18, exec_lo, mov, ins("v_readfirstlane_b32", s(14), v(6))]], [[]], wave64=False) == {id(mov)}
+    # a bitwise op with a data operand reads the number: wave64, the high half of a pair
+    cmp64, mov = ins("v_cmp_gt_u32_e64", s(16, 2), v(7), v(7)), ins("v_mov_b32_e32", v(3), s(17))
+    assert moves_of([[cmp64, mov, ins("v_and_b32_e32", v(24), imm(1), v(3))]], [[]]) == {id(mov)}
+    data_or = ins("v_or_b32_e32", v(2), v(3), v(9))
+    assert moves_of([[cmp64, mov, data_or]], [[]]) == {id(mov)}
+    # SDWA / DPP and other modified readers are never mask computations either
+    dpp_or = {"op": "v_or_b32_dpp", "args": [v(5), v(3), v(3)], "mods": ["row_shr:1", "row_mask:0x0"]}
+    assert moves_of([[cmp64, mov, dpp_or]], [[]]) == {id(mov)}
+    # the idiom: a bitwise op that computes a mask from the copy and other masks takes the move back when a
+    # v_readfirstlane reads its result
+    mov = ins("v_mov_b32_e32", v(1), s(3))
+    idiom = [cmp_a, cmp_b, mov, ins("v_or3_b32", v(2), v(1), s(47), s(3)), ins("v_readfirstlane_b32", s(5), v(2))]
+    assert moves_of([idiom], [[]]) == set()
+    # a copy on one path and a computed mask on the other meet at a v_readfirstlane: the VGPR is read as a mask
+    mov2 = ins("v_mov_b32_e32", v(1), s(47))
+    calc = ins("v_or3_b32", v(1), s(3), s(47), s(47))
+    join = [ins("v_readfirstlane_b32", s(5), v(1))]
+    diamond = [[1, 2], [3], [3], []]
+    assert moves_of([[cmp_a, cmp_b], [mov], [calc], join], diamond) == set()
+    # copies on both paths stay numbers
+    assert moves_of([[cmp_a, cmp_b], [mov], [mov2], join], diamond) == {id(mov), id(mov2)}
+
+
+def test_a_mask_computation_nothing_reads_as_a_mask_leaves_the_move():
+    # crosslane_fuzz seed 309700, program 30472: the xor computes a mask from the copy, but v7 is only stored, so it
+    # must not take the move back and write every lane, the ones EXEC has off included
+    mov = ins("v_mov_b32_e32", v(5), s(20))
+    xor = ins("v_xor_b32_e32", v(7), v(5), v(5))
+    head = [ins("s_mov_b32", sp("exec_lo"), imm(0x342ca)), ins("v_cmp_lt_u32_e64", s(16), v(3), v(3)),
+            ins("s_andn2_b32", s(20), s(16), s(16)), mov, xor]
+    assert moves_of([head], [[]], wave64=False) == {id(mov)}
+    # read as data (a compare, an add) it is still a number
+    for data in (ins("v_cmp_le_u32_e64", s(18), v(2), v(7)), ins("v_add_nc_u32_e32", v(9), v(7), v(2))):
+        assert moves_of([head + [data]], [[]], wave64=False) == {id(mov)}
+    # a v_readfirstlane reads it as a mask, directly, through a copy, or through a further computation
+    rfl = ins("v_readfirstlane_b32", s(14), v(8))
+    copy, calc = ins("v_mov_b32_e32", v(8), v(7)), ins("v_or_b32_e32", v(8), v(7), v(7))
+    assert moves_of([head + [ins("v_readfirstlane_b32", s(14), v(7))]], [[]], wave64=False) == set()
+    assert moves_of([head + [copy, rfl]], [[]], wave64=False) == set()
+    assert moves_of([head + [calc, rfl]], [[]], wave64=False) == set()
+    # a further computation nothing reads, or one read as data, leaves it alone
+    assert moves_of([head + [calc]], [[]], wave64=False) == {id(mov)}
+    assert moves_of([head + [calc, ins("v_add_nc_u32_e32", v(9), v(8), v(2))]], [[]], wave64=False) == {id(mov)}
+    # the computation sits in a loop and is read as a mask after it: the move goes; read by nothing, it stays
+    cmps = [ins("v_cmp_gt_u32_e64", s(3), v(7), v(7)), ins("v_cmp_lt_u32_e64", s(47), v(7), v(8))]
+    mov = ins("v_mov_b32_e32", v(5), s(3))
+    body = [ins("v_or3_b32", v(5), v(5), s(47), s(47))]
+    after = ins("v_readfirstlane_b32", s(5), v(5))
+    assert moves_of([cmps + [mov], body, [after]], [[1], [1, 2], []]) == set()
+    assert moves_of([cmps + [mov], body, [ins("s_nop", imm(0))]], [[1], [1, 2], []]) == {id(mov)}
 
 
 def test_bfm64_and_half_kinds():
@@ -382,6 +445,8 @@ if __name__ == "__main__":
     test_parked_masks()
     test_masks_through_a_vgpr()
     test_vmov_mask_copy_is_exec_gated()
+    test_number_moves_follow_what_reads_the_copy()
+    test_a_mask_computation_nothing_reads_as_a_mask_leaves_the_move()
     test_bfm64_and_half_kinds()
     test_b64_mask_imm_and_include_either()
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
