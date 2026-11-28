@@ -187,14 +187,21 @@ def _plain_move(ins):
 def number_moves(blocks, succ, masks, wave64=True):
     """The v_mov_b32 of a mask into a VGPR whose value nothing reads as a mask: ids of the instructions.
 
-    A value is read as a mask when a vector bitwise op or v_readfirstlane reads the VGPR while it holds one (the
-    v_mov / v_or3 / v_readfirstlane idiom). Each move is followed forward, through VGPR copies, while the register holds
-    a mask, so reuse of the register for another mask does not matter; moves that meet at such a read are all left as they were."""
+    A value is read as a mask when a v_readfirstlane reads the VGPR of a vector bitwise op that computes a mask from it
+    (the v_mov / v_or3 / v_readfirstlane idiom), through VGPR copies and further such ops, or when a v_readfirstlane
+    reads a VGPR some path computed a mask in. A computation nothing reads that way is an ordinary VALU write of
+    numbers, not the all-lanes store. A v_readfirstlane of a plain copy, or a bitwise op with a data operand
+    (v_and_b32 v1, 1, v0), reads its number: the copy skips the inactive lanes, so a mask rebuilt from them is not the
+    word the active lanes were given. Each move is followed forward, through VGPR copies, while the register holds a
+    mask, so reuse of the register for another mask does not matter; moves that meet at such a read are all left as
+    they were."""
     moves = {id(ins): ins["args"][0]["r"] for blk in blocks for ins in blk
              if _plain_move(ins) and mask_word_source(masks.get(id(ins), {}), ins["args"][1], wave64)}
     if not moves:
         return set()
-    used, entry = set(), [None] * len(blocks)           # entry: VGPR -> the moves whose value it may hold
+    writes = analyse(blocks, succ, wave64=wave64)[1]    # the ops that compute a mask while every move still is one
+    used, read, feeds = set(), set(), {}                # feeds: computation -> the moves and computations it reads
+    entry = [None] * len(blocks)                        # entry: VGPR -> the moves and computations whose value it may hold
     entry[0] = {}
     work = [0]
     while work:
@@ -206,16 +213,25 @@ def number_moves(blocks, succ, masks, wave64=True):
             copied = None
             if _plain_move(ins) and a[1]["k"] == "vgpr":
                 copied = reach.get(a[1]["r"])           # a copy of the value: what reads the copy decides
-            elif id(ins) not in moves and (op in VECTOR_BITWISE or op == "v_readfirstlane_b32"):
+            elif id(ins) in writes:
                 for x in a[1:]:
                     if x["k"] == "vgpr":
-                        used |= reach.get(x["r"], frozenset())
+                        feeds.setdefault(id(ins), set()).update(reach.get(x["r"], ()))
+            elif op == "v_readfirstlane_b32":
+                for x in a[1:]:
+                    if x["k"] == "vgpr":
+                        ids = reach.get(x["r"], frozenset())
+                        read |= ids & writes            # a computation read as a mask
+                        if ids & writes:                # a copy that meets one here is read as a mask too
+                            used |= ids
             if id(ins) in moves:
                 reach[moves[id(ins)]] = frozenset((id(ins),))
-            elif a and a[0]["k"] == "vgpr":             # written again: a mask computed in the VGPR is not a move
+            elif a and a[0]["k"] == "vgpr":
                 for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
                     reach.pop(r, None)
-                if copied:
+                if id(ins) in writes:                   # a mask computed in the VGPR is not a move
+                    reach[a[0]["r"]] = frozenset((id(ins),))
+                elif copied:
                     reach[a[0]["r"]] = copied
         for s in succ[n]:
             old = entry[s]
@@ -225,7 +241,13 @@ def number_moves(blocks, succ, masks, wave64=True):
             if old is None or merged != old:
                 entry[s] = merged
                 work.append(s)
-    return set(moves) - used
+    todo = list(read)
+    while todo:                                         # what a computation read as a mask reads is read as a mask too
+        for d in feeds.get(todo.pop(), ()):
+            if d not in read:
+                read.add(d)
+                todo.append(d)
+    return set(moves) - used - read
 
 
 def mask_word_operands(ins, state, moves=frozenset(), wave64=True):
